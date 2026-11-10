@@ -1,2 +1,3 @@
 detect/tpm-gpio-detect
+detect/tests/read-errors
 reset/tpm-gpio-assert

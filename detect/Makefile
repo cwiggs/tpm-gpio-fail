@@ -19,10 +19,16 @@ OBJ = detect.o \
 	platforms/jsl.o \
 	platforms/glk.o
 
-.PHONY: clean
+.PHONY: clean test
 
 tpm-gpio-detect: $(OBJ)
 	$(CC) $(LDFLAGS) $^ $(LDLIBS) -o $@
 
+tests/read-errors: tests/read-errors.c detect.c platforms/defs.h $(filter-out detect.o,$(OBJ))
+	$(CC) $(CFLAGS) $(LDFLAGS) tests/read-errors.c $(filter-out detect.o,$(OBJ)) $(LDLIBS) -o $@
+
+test: tests/read-errors
+	python3 tests/test_read_errors.py
+
 clean:
-	rm -f tpm-gpio-detect $(OBJ)
+	rm -f tpm-gpio-detect tests/read-errors $(OBJ)

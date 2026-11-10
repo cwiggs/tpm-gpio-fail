@@ -34,6 +34,28 @@ umount /media
 
 ## Exit codes
 
+### Detector (`tpm-gpio-detect`)
+
+The detector returns the number of unlocked pin configurations after a
+successful scan, or 126/127 for an unknown platform/hardware access error.
+Exit 2 is also used for platforms classified as not vulnerable by design;
+consult the result text rather than interpreting the exit code alone.
+
+If any required register read fails or returns fewer than four bytes, the
+detector stops with exit 127 and reports the lock state as **UNKNOWN**.
+Earlier output from a partial scan must not be treated as a completed audit.
+Linux `/dev/mem` restrictions can prevent reads even as root; this is not
+evidence that the firmware locked the GPIO pad.
+
+Hardware-free regression tests (requires Python 3 and the detector's build
+dependencies):
+
+```bash
+make -C detect test
+```
+
+### Reset tool (`tpm-gpio-assert`)
+
 | Code | Meaning |
 |---|---|
 | 0 | DW0 write verified -- the pad reconfigured, PLTRST# edge created (vulnerable) |

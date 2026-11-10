@@ -64,28 +64,33 @@ __attribute__((destructor)) static void close_devmemfd(void)
 		close(devmemfd);
 }
 
-static uint32_t pcr_read32(uint8_t port, uint16_t offset)
+static int pcr_read32(uint8_t port, uint16_t offset, uint32_t *value)
 {
 	uint32_t ret;
-	if (pread(devmemfd, &ret, sizeof ret, sbreg_base + (port << 16) + offset) != sizeof ret) {
-		perror("/dev/mem");
-		ret = -1;
+	uint64_t address = sbreg_base + ((uint64_t)port << 16) + offset;
+	ssize_t bytes = pread(devmemfd, &ret, sizeof ret, address);
+	if (bytes != sizeof ret) {
+		int saved_errno = errno;
+		fprintf(stderr, "/dev/mem: read port 0x%02x offset 0x%04x "
+			"(address 0x%" PRIx64 "): ", port, offset, address);
+		if (bytes < 0)
+			fprintf(stderr, "%s\n", strerror(saved_errno));
+		else
+			fprintf(stderr, "short read (%zd of %zu bytes)\n", bytes, sizeof ret);
+		return -1;
 	}
-	return ret;
-}
-
-static void pcr_write32(uint8_t port, uint16_t offset, uint32_t val)
-{
-	if (pwrite(devmemfd, &val, sizeof val, sbreg_base + (port << 16) + offset) != sizeof val)
-		perror("/dev/mem");
+	*value = ret;
+	return 0;
 }
 
 static int detect_pinset(struct pin *pins)
 {
 	int unlocked = 0;
 	for (struct pin *pin = pins; pin->gpio; ++pin) {
-		uint32_t lock_val = pcr_read32(pin->port, pin->lock_offset);
-		uint32_t locktx_val = pcr_read32(pin->port, pin->lock_offset + 4);
+		uint32_t lock_val, locktx_val;
+		if (pcr_read32(pin->port, pin->lock_offset, &lock_val) < 0 ||
+		    pcr_read32(pin->port, pin->lock_offset + 4, &locktx_val) < 0)
+			return -1;
 		int cfg_locked = !!(lock_val & pin->lock_bit);
 		int tx_locked = !!(locktx_val & pin->lock_bit);
 		unlocked += !cfg_locked;
@@ -117,6 +122,8 @@ static int scan_platform(struct platform *platform, int *pltrst_locked_out)
 			printf("  %-10s %-12s %-22s %-22s\n",
 			       "GPIO", "Signal", "PADCFGLOCK", "PADCFGLOCKTX");
 			status = detect_pinset(platform->global_pins);
+			if (status < 0)
+				return -1;
 			pltrst_locked = (status == 0);
 		}
 	} else {
@@ -128,7 +135,9 @@ static int scan_platform(struct platform *platform, int *pltrst_locked_out)
 		uint32_t dw0_offs = platform->dw0_offset ? platform->dw0_offset :
 			platform->pad_cfg_base +
 			(__builtin_ctz(platform->global_pins->lock_bit) * platform->pad_stride);
-		uint32_t dw0 = pcr_read32(platform->global_pins->port, dw0_offs);
+		uint32_t dw0;
+		if (pcr_read32(platform->global_pins->port, dw0_offs, &dw0) < 0)
+			return -1;
 		uint32_t pad_mode = (dw0 >> 10) & 0xf;
 		const char *mode_str = pad_mode == 0 ? "GPIO" : pad_mode == 1 ? "NF1" : "NF2+";
 		printf("\n--- Pad Configuration ---\n");
@@ -142,7 +151,9 @@ static int scan_platform(struct platform *platform, int *pltrst_locked_out)
 		/* HOST_OWN for GPP_B13 (SKL/KBL community 0, group 1): 1 = host owns
 		 * the pad (reconfigurable), 0 = SMM keeps ownership (host writes gated) */
 		if (platform->global_pins->port == 0xaf) {
-			uint32_t host_own = pcr_read32(0xaf, 0xd4);
+			uint32_t host_own;
+			if (pcr_read32(0xaf, 0xd4, &host_own) < 0)
+				return -1;
 			printf("HOST_OWN (0xAF:0xD4 bit 13, GPP_B13) = %d\n",
 			       !!(host_own & (1u << 13)));
 		}
@@ -156,8 +167,13 @@ static int scan_platform(struct platform *platform, int *pltrst_locked_out)
 	if (platform->lpc_pins) {
 		if (platform->espi_check_bit == 0)
 			is_espi = 0;  /* device ID implies LPC, no register read needed */
-		else
-			is_espi = !!(pcr_read32(platform->espi_check_port, platform->espi_check_offset) & platform->espi_check_bit);
+		else {
+			uint32_t bus_config;
+			if (pcr_read32(platform->espi_check_port,
+				       platform->espi_check_offset, &bus_config) < 0)
+				return -1;
+			is_espi = !!(bus_config & platform->espi_check_bit);
+		}
 	}
 
 	if (platform->espi_pins || platform->lpc_pins) {
@@ -168,10 +184,10 @@ static int scan_platform(struct platform *platform, int *pltrst_locked_out)
 		} else {
 			printf("  %-10s %-12s %-22s %-22s\n",
 			       "GPIO", "Signal", "PADCFGLOCK", "PADCFGLOCKTX");
-			if (is_espi)
-				status += detect_pinset(platform->espi_pins);
-			else
-				status += detect_pinset(platform->lpc_pins);
+			int bus_status = detect_pinset(is_espi ? platform->espi_pins : platform->lpc_pins);
+			if (bus_status < 0)
+				return -1;
+			status += bus_status;
 		}
 	} else {
 		printf("No bus pins defined for this platform\n");
@@ -201,6 +217,22 @@ static int scan_platform(struct platform *platform, int *pltrst_locked_out)
 	if (pltrst_locked_out)
 		*pltrst_locked_out = pltrst_locked;
 	return status;
+}
+
+static int audit_platform(struct platform *platform)
+{
+	int pltrst_locked = -1;
+	int err = scan_platform(platform, &pltrst_locked);
+	if (err < 0) {
+		printf("\n=== RESULT: hardware access error; lock state UNKNOWN ===\n");
+		return 127;
+	}
+
+	printf("\n=== RESULT: PLTRST# pad %s; %d pin%s unlocked ===\n",
+	       pltrst_locked == 1 ? "LOCKED (mitigated)" :
+	       pltrst_locked == 0 ? "UNLOCKED (vulnerable)" : "not affected",
+	       err, err == 1 ? "" : "s");
+	return err;
 }
 
 int main(void)
@@ -323,7 +355,7 @@ int main(void)
 	pci_cleanup(pacc);
 
 	/* 4. Open /dev/mem for PCR access */
-	devmemfd = open("/dev/mem", O_RDWR);
+	devmemfd = open("/dev/mem", O_RDONLY);
 	if (devmemfd < 0) {
 		perror("/dev/mem");
 		printf("\n=== RESULT: hardware access error ===\n");
@@ -331,16 +363,5 @@ int main(void)
 	}
 
 	/* 5. Scan platform (detect pins via PCR) */
-	int pltrst_locked = -1;
-	int err = scan_platform(platform, &pltrst_locked);
-	if (err < 0) {
-		printf("\n=== RESULT: hardware access error ===\n");
-		return 127;
-	}
-
-	printf("\n=== RESULT: PLTRST# pad %s; %d pin%s unlocked ===\n",
-	       pltrst_locked == 1 ? "LOCKED (mitigated)" :
-	       pltrst_locked == 0 ? "UNLOCKED (vulnerable)" : "not affected",
-	       err, err == 1 ? "" : "s");
-	return err;
+	return audit_platform(platform);
 }
